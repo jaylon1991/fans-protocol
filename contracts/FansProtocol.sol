@@ -10,58 +10,34 @@ import "./FansToken.sol";
 interface IUniswapV2Router02 {
     function addLiquidityETH(
         address token,
-        uint amountTokenDesired,
-        uint amountTokenMin,
-        uint amountETHMin,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
         address to,
-        uint deadline
-    ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+        uint256 deadline
+    ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
 }
 
 contract FansProtocol is Ownable, ReentrancyGuard {
+    IERC20 public currencyToken;
+
     // Bonding Curve parameters
-    uint256 constant A = 1073000191;
-    uint256 constant B = 32190005730;
-    uint256 public constant MARKET_CAP_THRESHOLD = 60000 ether; // Adjusted as per ETH price
-    uint256 public totalEPTCollected;
+    uint256 public constant A = 1073000191;
+    uint256 public constant B = 32190005730;
+    uint256 public constant PROGRESS_THRESHOLD = 263300 * 10**18; // 100% PROGRESS
     bool public isDEXPhase;
 
     // Platform fees
-    uint256 public constant PLATFORM_FEE_BP = 100; // 1% (basis points)
+    uint256 public constant PLATFORM_FEE_BP = 50; // 0.5% (basis points)
     uint256 public constant DEX_FEE_BP = 50; // 0.5% (basis points)
 
     // Uniswap V2 Router address (Ethereum mainnet)
     address private constant UNISWAP_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
     IUniswapV2Router02 public uniswapRouter;
 
-    // Events
-    event TokenCreate(
-        address indexed creator,
-        address token,
-        uint256 requestId,
-        string name,
-        string symbol,
-        uint256 totalSupply,
-        uint256 launchTime
-    );
-    event TokenPurchase(
-        address indexed token,
-        address indexed account,
-        uint256 tokenAmount,
-        uint256 etherAmount
-    );
-    event TokenSale(
-        address indexed token,
-        address indexed account,
-        uint256 tokenAmount,
-        uint256 etherAmount
-    );
-    event LiquidityAdded(
-        address indexed token,
-        uint256 tokenAmount,
-        uint256 etherAmount,
-        uint256 liquidity
-    );
+    uint256 public tokenCount = 1;
+    uint256 public totalFeeCollected;
+    mapping(uint256 => TokenInfo) public tokens;
 
     // Structs
     struct TokenInfo {
@@ -69,286 +45,245 @@ contract FansProtocol is Ownable, ReentrancyGuard {
         string name;
         string symbol;
         address creator;
-        string description;
-        uint256 launchTime;
-        uint256 totalSupply;
-        uint256 virtualLiquidity; // Denominated in ETH
-        uint256 tradingVolume;    // Denominated in tokens
+        uint256 tokenSold; //// Denominated in wei
+        uint256 currencyCollected; // Denominated in wei
     }
 
-    uint256 public tokenCount;
-    mapping(uint256 => TokenInfo) public tokens;
+    // Events
+    event TokenCreation(
+        uint256 tokenId, address tokenAddress, string name, string symbol, uint256 launchTime, address tokenCreator
+    );
 
-    constructor() Ownable(msg.sender) {
+    event TokenTrade(
+        bool isTokenPurchase,
+        uint256 tokenId,
+        address indexed tokenAddress,
+        address indexed trader,
+        uint256 tokenAmount,
+        uint256 currencyAmount
+    );
+
+    event DEXPoolCreation(address token, uint256 amountETH, uint256 amountToken);
+
+    constructor(IERC20 _currencyToken) Ownable(msg.sender) {
+        currencyToken = _currencyToken;
         uniswapRouter = IUniswapV2Router02(UNISWAP_V2_ROUTER);
     }
 
     // Create new fan token
-    function createToken(
-        string memory name,
-        string memory symbol,
-        uint256 initialSupply,
-        string memory description
-    ) external payable returns (address) {
-        require(!isDEXPhase, "Cannot create tokens in DEX phase");
+    function createToken(string memory name, string memory symbol, bytes32 _salt)
+        external
+        nonReentrant
+        returns (address)
+    {
         require(bytes(name).length > 0 && bytes(symbol).length > 0, "Invalid name or symbol");
-        require(initialSupply > 0, "Initial supply must be greater than zero");
 
-        FansToken token = new FansToken(name, symbol, initialSupply, description, address(this));
-        tokenCount += 1;
+        //user transfer fan token creation fee to contract
+        require(currencyToken.balanceOf(msg.sender) >= 50 * 10**18, "Insufficient currency token");
+        currencyToken.transferFrom(msg.sender, address(this), 50 * 10**18);
+        totalFeeCollected += 50 * 10**18;
+
+        FansToken token = new FansToken{salt: _salt}(name, symbol, address(this));
+        require(address(token) != address(0));
+        require((tokens[tokenCount]).tokenAddress == address(0), "Invalid tokenId");
 
         tokens[tokenCount] = TokenInfo({
             tokenAddress: address(token),
             name: name,
             symbol: symbol,
             creator: msg.sender,
-            description: description,
-            launchTime: block.timestamp,
-            totalSupply: initialSupply * (10 ** token.decimals()),
-            virtualLiquidity: msg.value,
-            tradingVolume: 0
+            tokenSold: 0,
+            currencyCollected: 0
         });
 
-        emit TokenCreate(
-            msg.sender,
-            address(token),
-            tokenCount,
-            name,
-            symbol,
-            initialSupply,
-            block.timestamp
-        );
-        
+        emit TokenCreation(tokenCount, address(token), name, symbol, block.timestamp, msg.sender);
+
+        tokenCount++;
+
         return address(token);
     }
 
-    // Purchase tokens: User pays ETH to buy fan tokens
-    function purchaseTokenAMAP(uint256 tokenId, uint256 minAmount) external payable nonReentrant {
+    // Purchase tokens: User buy fan tokens with specified amount of currency tokens
+    function purchaseTokenWithCurrency(uint256 tokenId, uint256 currencyAmount) external nonReentrant {
         require(!isDEXPhase, "DEX phase: Use DEX to trade");
+        // Check if market cap threshold is reached
+        checkProgress(tokenId);
+
         TokenInfo storage tokenInfo = tokens[tokenId];
         require(tokenInfo.tokenAddress != address(0), "Invalid token");
-        require(msg.value > 0, "Ether amount must be greater than zero");
+        require(
+            currencyAmount > 0 && currencyToken.balanceOf(msg.sender) >= currencyAmount, "Insufficient currency token"
+        );
 
-        uint256 funds = msg.value;
-
-        // Calculate x value (amount of ETH already collected)
-        uint256 x = tokenInfo.virtualLiquidity;
-        uint256 denominator = 30 + (12 * x);
-        require(denominator != 0, "Denominator cannot be zero");
-
-        // Calculate current price Y based on Bonding Curve formula
-        uint256 y = A - (B / denominator); // y is price per token in wei
-
-        // Calculate token amount to transfer based on funds
-        // Ensure that tokenAmount is in smallest unit by considering token decimals
-        uint256 tokenDecimals = IERC20Metadata(tokenInfo.tokenAddress).decimals();
-        uint256 tokenAmount = (funds * (10 ** tokenDecimals)) / y; // tokens with tokenDecimals
-
-        require(tokenAmount >= minAmount, "Slippage too high"); // minAmount is in smallest unit
+        //user transfer currency token to contract
+        currencyToken.transferFrom(msg.sender, address(this), currencyAmount);
 
         // Calculate platform fee
-        uint256 fee = (funds * PLATFORM_FEE_BP) / 10000;
-        uint256 netFunds = funds - fee;
-        totalEPTCollected += netFunds;
+        uint256 fee = (currencyAmount * PLATFORM_FEE_BP) / 10000;
+        totalFeeCollected += fee;
+        uint256 netFunds = currencyAmount - fee;
+
+        // Calculate amount of currency already collected
+        uint256 x1 = tokenInfo.currencyCollected;
+        uint256 y1 = tokenInfo.tokenSold;
+        uint256 denominator = 30 * 10**18  + (x1 + netFunds) / 3000;
+
+        // Calculate the supply after trade based on Bonding Curve formula
+        uint256 y2 = A * 10**18 - (B * 10**36 / denominator) ;
+        uint256 tokenAmount = y2 - y1;
+
+        // avoiding too deep stack error
+        {
+        // Check if the contract has enough tokens to transfer
+        IERC20 fansToken = IERC20(tokenInfo.tokenAddress);
+        uint256 contractTokenBalance = fansToken.balanceOf(address(this));
+        require(contractTokenBalance > tokenAmount, "ERC20InsufficientBalance");
+
+        // Transfer tokens to user
+        fansToken.transfer(msg.sender, tokenAmount);
+        }
+
+        // Update tokeninfo
+        tokenInfo.currencyCollected += netFunds;
+        tokenInfo.tokenSold += tokenAmount;
+
+        // Check if progress threshold is reached
+        checkProgress(tokenId);
+
+        emit TokenTrade(true, tokenId, tokenInfo.tokenAddress, msg.sender, tokenAmount, currencyAmount);
+    }
+
+    // Purchase tokens: User specifies purchase amount of fan token
+    function purchaseToken(uint256 tokenId, uint256 tokenAmount) external nonReentrant {
+        require(!isDEXPhase, "DEX phase: Use DEX to trade");
+        // Check if progress threshold is reached
+        checkProgress(tokenId);
+
+        require(tokenAmount > 0, "Amount must be greater than zero");
+        TokenInfo storage tokenInfo = tokens[tokenId];
+        require(tokenInfo.tokenAddress != address(0), "Invalid token");
+
+        // Current token info
+        uint256 x1 = tokenInfo.currencyCollected;
+        uint256 y1 = tokenInfo.tokenSold;
+
+        // Calculate token info after trade
+        uint256 y2 = y1 + tokenAmount;
+
+        uint256 x2 = (B * 10**36 / (A * 10**18 - y2) - 30 * 10**18) * 3000;
+
+        // Calculate required funds
+        uint256 netFunds = x2 - x1; // Currency token required in wei
+
+        // Calculate fee
+        uint256 fee = (netFunds * PLATFORM_FEE_BP) / 10000;
+        uint256 requiredFunds = netFunds + fee;
+
+        //user transfer currency token to contract
+        require(requiredFunds > 0 && currencyToken.balanceOf(msg.sender) >= requiredFunds, "Insufficient currency token");
+        currencyToken.transferFrom(msg.sender, address(this), requiredFunds);
+
+        totalFeeCollected += fee;
+        tokenInfo.currencyCollected += netFunds;
+
+        // Transfer tokens to user
+        tokenInfo.tokenSold = y2;
 
         // Check if the contract has enough tokens to transfer
         IERC20 fansToken = IERC20(tokenInfo.tokenAddress);
         uint256 contractTokenBalance = fansToken.balanceOf(address(this));
-        require(contractTokenBalance >= tokenAmount, "ERC20InsufficientBalance");
+        require(contractTokenBalance > tokenAmount, "ERC20InsufficientBalance");
 
-        // Transfer tokens to user
-        fansToken.transfer(msg.sender, tokenAmount);
-
-        // Update virtual liquidity and trading volume
-        tokenInfo.virtualLiquidity += netFunds;
-        tokenInfo.tradingVolume += tokenAmount;
-
-        // Refund excess Ether if any
-        uint256 refund = funds - netFunds;
-        if (refund > 0) {
-            (bool success, ) = payable(msg.sender).call{value: refund}("");
-            require(success, "Refund failed");
-        }
+        FansToken(tokenInfo.tokenAddress).transfer(msg.sender, tokenAmount);
 
         // Check if market cap threshold is reached
-        checkMarketCap(tokenId);
+        checkProgress(tokenId);
 
-        emit TokenPurchase(tokenInfo.tokenAddress, msg.sender, tokenAmount, netFunds);
+        emit TokenTrade(true, tokenId, tokenInfo.tokenAddress, msg.sender, tokenAmount, requiredFunds);
     }
 
-    // Purchase tokens: User specifies purchase amount
-    function purchaseToken(uint256 tokenId, uint256 amount) external payable nonReentrant {
+    // Sell tokens: User sells fan tokens back to the contract for currency token
+    function sellToken(uint256 tokenId, uint256 tokenAmount) external nonReentrant {
         require(!isDEXPhase, "DEX phase: Use DEX to trade");
-        require(amount > 0, "Amount must be greater than zero");
+        // Check if progress threshold is reached
+        checkProgress(tokenId);
+
         TokenInfo storage tokenInfo = tokens[tokenId];
         require(tokenInfo.tokenAddress != address(0), "Invalid token");
-        require(msg.value > 0, "Ether amount must be greater than zero");
+        require(tokenAmount > 0 && IERC20(tokenInfo.tokenAddress).balanceOf(msg.sender) >= tokenAmount, "Insufficient fan token");
 
-        // Calculate x value (amount of ETH already collected)
-        uint256 x = tokenInfo.virtualLiquidity;
-        uint256 denominator = 30 + (12 * x);
-        require(denominator != 0, "Denominator cannot be zero");
+        // Calculate
+        uint256 x1 = tokenInfo.currencyCollected;
+        uint256 y1 = tokenInfo.tokenSold;
+        uint256 y2 = y1 - tokenAmount;
+        uint256 x2 = (B * 10**36 / (A * 10**18 - y2) - 30 * 10**18) * 3000;
 
-        // Calculate current price Y based on Bonding Curve formula
-        uint256 y = A - (B / denominator);
-
-        // Calculate required funds
-        uint256 requiredFunds = amount * y; // Ether required in wei
-        require(msg.value >= requiredFunds, "Insufficient Ether sent");
+        // Calculate currency amount to pay
+        uint256 currencyToPay = x1 - x2;
+        require(currencyToken.balanceOf(address(this)) >= currencyToPay, "Insufficient ETH in contract");
 
         // Calculate fee
-        uint256 fee = (requiredFunds * PLATFORM_FEE_BP) / 10000;
-        uint256 netFunds = requiredFunds - fee;
-        totalEPTCollected += netFunds;
+        uint256 fee = (currencyToPay * PLATFORM_FEE_BP) / 10000;
+        totalFeeCollected += fee;
+        uint256 netCurrencyToPay = currencyToPay - fee;
 
-        // Transfer tokens to user
-        FansToken(tokenInfo.tokenAddress).transfer(msg.sender, amount);
-
-        // Update virtual liquidity and trading volume
-        tokenInfo.virtualLiquidity += netFunds;
-        tokenInfo.tradingVolume += amount;
-
-        // Refund excess Ether
-        if (msg.value > requiredFunds) {
-            uint256 refund = msg.value - requiredFunds;
-            payable(msg.sender).transfer(refund);
-        }
-
-        // Check if market cap threshold is reached
-        checkMarketCap(tokenId);
-
-        emit TokenPurchase(tokenInfo.tokenAddress, msg.sender, amount, netFunds);
-    }
-
-
-    // Sell tokens: User sells fan tokens back to the contract for ETH
-    function sellToken(uint256 tokenId, uint256 amount) external nonReentrant {
-        require(!isDEXPhase, "DEX phase: Use DEX to trade");
-        require(amount > 0, "Amount must be greater than zero");
-        TokenInfo storage tokenInfo = tokens[tokenId];
-        require(tokenInfo.tokenAddress != address(0), "Invalid token");
-
-        // Calculate x value (amount of ETH already collected)
-        uint256 x = tokenInfo.virtualLiquidity;
-        uint256 denominator = 30 + (12 * x);
-        require(denominator != 0, "Denominator cannot be zero");
-
-        // Calculate current price Y based on Bonding Curve formula
-        uint256 y = A - (B / denominator);
-
-        // Calculate ETH amount
-        uint256 etherAmount = (amount * y) / 1e18;
-        require(address(this).balance >= etherAmount, "Insufficient ETH in contract");
-
-        // Calculate fee
-        uint256 fee = (etherAmount * PLATFORM_FEE_BP) / 10000;
-        uint256 netEther = etherAmount - fee;
-
-        // Update virtual liquidity and trading volume before external calls
-        tokenInfo.virtualLiquidity -= netEther;
-        tokenInfo.tradingVolume += amount;
-        totalEPTCollected -= netEther;
+        // Update toke info before external calls
+        tokenInfo.currencyCollected = x2;
+        tokenInfo.tokenSold = y2;
 
         // Transfer tokens from user to contract and burn them
-        FansToken(tokenInfo.tokenAddress).transferFrom(msg.sender, address(this), amount);
-        FansToken(tokenInfo.tokenAddress).burn(amount);
+        FansToken(tokenInfo.tokenAddress).transferFrom(msg.sender, address(this), tokenAmount);
 
-        // Transfer ETH to user
-        payable(msg.sender).transfer(netEther);
+        // Transfer currency token to user
+        currencyToken.transfer(msg.sender, netCurrencyToPay);
 
-        emit TokenSale(tokenInfo.tokenAddress, msg.sender, amount, netEther);
-    }
-
-    // Calculate token amount required for purchase (based on Bonding Curve)
-    function getTokenAmount(uint256 funds, uint256 x) public pure returns (uint256) {
-        uint256 denominator = 30 + (12 * x);
-        require(denominator != 0, "Denominator cannot be zero");
-        uint256 y = A - (B / denominator);
-        return (funds * 1e18) / y; // Token amount in wei
-    }
-
-    // Calculate funds required to sell tokens (based on Bonding Curve)
-    function getFundsAmount(uint256 amount, uint256 x) public pure returns (uint256) {
-        uint256 denominator = 30 + (12 * x);
-        require(denominator != 0, "Denominator cannot be zero");
-        uint256 y = A - (B / denominator);
-        return (amount * y) / 1e18; // Ether amount in wei
+        emit TokenTrade(false, tokenId, tokenInfo.tokenAddress, msg.sender, tokenAmount, currencyToPay);
     }
 
     // Check if market cap threshold is reached, if so, transition to DEX phase
-    function checkMarketCap(uint256 tokenId) internal {
+    function checkProgress(uint256 tokenId) internal {
         TokenInfo storage tokenInfo = tokens[tokenId];
-        uint256 marketCap = tokenInfo.virtualLiquidity; // Adjust as per actual market cap calculation
 
-        if (marketCap >= MARKET_CAP_THRESHOLD && !isDEXPhase) {
+        if (tokenInfo.currencyCollected >= PROGRESS_THRESHOLD) {
             isDEXPhase = true;
-            // Transfer remaining fan tokens and collected EPT to Trading Protocol to form permanent LP
-            transferToTradingProtocol(tokenId);
+        }
+
+        if(isDEXPhase) {
+            // Transfer remaining fan tokens and collected ether to Trading Protocol to form permanent LP
+            transferToDEX(tokenId);
         }
     }
 
     // Add tokens and ETH to Uniswap liquidity pool
-    function transferToTradingProtocol(uint256 tokenId) internal {
+    function transferToDEX(uint256 tokenId) internal {
         TokenInfo storage tokenInfo = tokens[tokenId];
         uint256 tokenAmount = FansToken(tokenInfo.tokenAddress).balanceOf(address(this));
-        uint256 ethAmount = address(this).balance;
+        totalFeeCollected += 20000 * 10**18; // DEX Listing fee
+        uint256 currencyAmount = tokenInfo.currencyCollected - 20000 * 10**18;
 
-        if (tokenAmount > 0 && ethAmount > 0) {
+        if (tokenAmount > 0 && currencyAmount > 0) {
             // Approve Uniswap Router to spend tokens
             FansToken(tokenInfo.tokenAddress).approve(address(uniswapRouter), tokenAmount);
 
             // Add liquidity
-            (uint amountToken, uint amountETH, uint liquidity) = uniswapRouter.addLiquidityETH{value: ethAmount}(
+            uniswapRouter.addLiquidityETH{value: currencyAmount}(
                 tokenInfo.tokenAddress,
                 tokenAmount,
-                0, // Accept any amount of tokens
-                0, // Accept any amount of ETH
+                0, // Accept any amount of fan tokens
+                0, // Accept any amount of currency token
                 address(this), // Liquidity tokens held by the contract itself
                 block.timestamp
             );
 
-            emit LiquidityAdded(tokenInfo.tokenAddress, amountToken, amountETH, liquidity);
+            emit DEXPoolCreation(tokenInfo.tokenAddress, tokenAmount, currencyAmount);
         }
-    }
-
-    // Add liquidity to DEX, users can use this function to add liquidity and earn fee income
-    function addLiquidity(uint256 tokenId, uint256 tokenAmount) external payable nonReentrant {
-        require(isDEXPhase, "Liquidity can only be added in DEX phase");
-        require(tokenAmount > 0, "Token amount must be greater than zero");
-        require(msg.value > 0, "Ether amount must be greater than zero");
-        TokenInfo storage tokenInfo = tokens[tokenId];
-        require(tokenInfo.tokenAddress != address(0), "Invalid token");
-
-        // Transfer tokens from user to contract
-        FansToken(tokenInfo.tokenAddress).transferFrom(msg.sender, address(this), tokenAmount);
-
-        // Approve Uniswap Router to spend tokens
-        FansToken(tokenInfo.tokenAddress).approve(address(uniswapRouter), tokenAmount);
-
-        // Add liquidity
-        (uint amountToken, uint amountETH, uint liquidity) = uniswapRouter.addLiquidityETH{value: msg.value}(
-            tokenInfo.tokenAddress,
-            tokenAmount,
-            0, // Accept any amount of tokens
-            0, // Accept any amount of ETH
-            msg.sender, // Liquidity tokens sent to the user
-            block.timestamp
-        );
-
-        // Refund excess tokens to user
-        uint256 remainingTokens = FansToken(tokenInfo.tokenAddress).balanceOf(address(this));
-        if (remainingTokens > 0) {
-            FansToken(tokenInfo.tokenAddress).transfer(msg.sender, remainingTokens);
-        }
-
-        emit LiquidityAdded(tokenInfo.tokenAddress, amountToken, amountETH, liquidity);
     }
 
     // Withdraw platform fees to platform address
     function withdrawFees(address payable to, uint256 amount) external onlyOwner {
         require(to != address(0), "Invalid address");
-        require(amount <= address(this).balance, "Insufficient balance");
-        to.transfer(amount);
+        require(amount <= totalFeeCollected, "Insufficient balance");
+        currencyToken.transfer(to, amount);
     }
 
     // Allow contract to receive ETH

@@ -32,7 +32,7 @@ contract FansProtocol is Ownable, ReentrancyGuard {
     uint256 public constant DEX_FEE_BP = 50; // 0.5% (basis points)
 
     // Uniswap V2 Router address (Ethereum mainnet)
-    address private constant UNISWAP_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address private constant UNISWAP_V2_ROUTER = 0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008;
     IUniswapV2Router02 public uniswapRouter;
 
     uint256 public tokenCount = 1;

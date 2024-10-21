@@ -6,16 +6,22 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./FansToken.sol";
 
-// Uniswap V2 Router interface
+// Uniswap V2 Router interface for adding liquidity between two ERC20 tokens
 interface IUniswapV2Router02 {
-    function addLiquidityETH(
-        address token,
-        uint256 amountTokenDesired,
-        uint256 amountTokenMin,
-        uint256 amountETHMin,
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
         address to,
         uint256 deadline
-    ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
+    ) external returns (
+        uint256 amountA,
+        uint256 amountB,
+        uint256 liquidity
+    );
 }
 
 contract FansProtocol is Ownable, ReentrancyGuard {
@@ -253,31 +259,39 @@ contract FansProtocol is Ownable, ReentrancyGuard {
             transferToDEX(tokenId);
         }
     }
+event Debug(string message, uint256 value);
 
-    // Add tokens and ETH to Uniswap liquidity pool
-    function transferToDEX(uint256 tokenId) internal {
-        TokenInfo storage tokenInfo = tokens[tokenId];
-        uint256 tokenAmount = FansToken(tokenInfo.tokenAddress).balanceOf(address(this));
-        totalFeeCollected += 20000 * 10**18; // DEX Listing fee
-        uint256 currencyAmount = tokenInfo.currencyCollected - 20000 * 10**18;
+// 在 transferToDEX 中添加日志
+function transferToDEX(uint256 tokenId) internal {
+    TokenInfo storage tokenInfo = tokens[tokenId];
+    uint256 tokenAmount = FansToken(tokenInfo.tokenAddress).balanceOf(address(this));
+    uint256 currencyAmount = tokenInfo.currencyCollected - 20000 * 10**18;
 
-        if (tokenAmount > 0 && currencyAmount > 0) {
-            // Approve Uniswap Router to spend tokens
-            FansToken(tokenInfo.tokenAddress).approve(address(uniswapRouter), tokenAmount);
+    emit Debug("Token Amount", tokenAmount);
+    emit Debug("Currency Amount", currencyAmount);
 
-            // Add liquidity
-            uniswapRouter.addLiquidityETH{value: currencyAmount}(
-                tokenInfo.tokenAddress,
-                tokenAmount,
-                0, // Accept any amount of fan tokens
-                0, // Accept any amount of currency token
-                address(this), // Liquidity tokens held by the contract itself
-                block.timestamp
-            );
+    if (tokenAmount > 0 && currencyAmount > 0) {
+        // Approve Uniswap Router to spend tokens
+        FansToken(tokenInfo.tokenAddress).approve(address(uniswapRouter), tokenAmount);
+        currencyToken.approve(address(uniswapRouter), currencyAmount);
 
-            emit DEXPoolCreation(tokenInfo.tokenAddress, tokenAmount, currencyAmount);
-        }
+        // Add liquidity
+        uniswapRouter.addLiquidity(
+            tokenInfo.tokenAddress,
+            address(currencyToken),
+            tokenAmount,
+            currencyAmount,
+            0, // Accept any amount of fan tokens
+            0, // Accept any amount of currency token
+            address(this), // Liquidity tokens held by the contract itself
+            block.timestamp
+        );
+
+        emit DEXPoolCreation(tokenInfo.tokenAddress, tokenAmount, currencyAmount);
+    } else {
+        emit Debug("Insufficient token or currency amount", 0);
     }
+}
 
     // Withdraw platform fees to platform address
     function withdrawFees(address payable to, uint256 amount) external onlyOwner {

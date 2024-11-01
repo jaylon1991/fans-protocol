@@ -71,6 +71,8 @@ contract FansProtocol is Ownable, ReentrancyGuard {
 
     event DEXPoolCreation(address token, uint256 amountETH, uint256 amountToken);
 
+    event Debug(string message, uint256 value);
+
     constructor(IERC20 _currencyToken) Ownable(msg.sender) {
         currencyToken = _currencyToken;
         uniswapRouter = IUniswapV2Router02(UNISWAP_V2_ROUTER);
@@ -80,18 +82,18 @@ contract FansProtocol is Ownable, ReentrancyGuard {
     function createToken(string memory name, string memory symbol, bytes32 _salt)
         external
         nonReentrant
-        returns (address)
+        returns (address, uint256)
     {
         require(bytes(name).length > 0 && bytes(symbol).length > 0, "Invalid name or symbol");
 
-        //user transfer fan token creation fee to contract
+        // User transfers fan token creation fee to contract
         require(currencyToken.balanceOf(msg.sender) >= 50 * 10**18, "Insufficient currency token");
         currencyToken.transferFrom(msg.sender, address(this), 50 * 10**18);
         totalFeeCollected += 50 * 10**18;
 
         FansToken token = new FansToken{salt: _salt}(name, symbol, address(this));
-        require(address(token) != address(0));
-        require((tokens[tokenCount]).tokenAddress == address(0), "Invalid tokenId");
+        require(address(token) != address(0), "Token creation failed");
+        require(tokens[tokenCount].tokenAddress == address(0), "Invalid tokenId");
 
         tokens[tokenCount] = TokenInfo({
             tokenAddress: address(token),
@@ -104,9 +106,10 @@ contract FansProtocol is Ownable, ReentrancyGuard {
 
         emit TokenCreation(tokenCount, address(token), name, symbol, block.timestamp, msg.sender);
 
+        uint256 currentTokenId = tokenCount;
         tokenCount++;
 
-        return address(token);
+        return (address(token), currentTokenId);
     }
 
     // Purchase tokens: User buy fan tokens with specified amount of currency tokens
@@ -121,7 +124,7 @@ contract FansProtocol is Ownable, ReentrancyGuard {
             currencyAmount > 0 && currencyToken.balanceOf(msg.sender) >= currencyAmount, "Insufficient currency token"
         );
 
-        //user transfer currency token to contract
+        // User transfers currency token to contract
         currencyToken.transferFrom(msg.sender, address(this), currencyAmount);
 
         // Calculate platform fee
@@ -131,25 +134,24 @@ contract FansProtocol is Ownable, ReentrancyGuard {
 
         // Calculate amount of currency already collected
         uint256 x1 = tokenInfo.currencyCollected;
-        uint256 y1 = tokenInfo.tokenSold;
         uint256 denominator = 30 * 10**18  + (x1 + netFunds) / 3000;
 
         // Calculate the supply after trade based on Bonding Curve formula
-        uint256 y2 = A * 10**18 - (B * 10**36 / denominator) ;
-        uint256 tokenAmount = y2 - y1;
+        uint256 y2 = A * 10**18 - (B * 10**36 / denominator);
+        uint256 tokenAmount = y2 - tokenInfo.tokenSold;
 
-        // avoiding too deep stack error
+        // Avoiding too deep stack error
         {
-        // Check if the contract has enough tokens to transfer
-        IERC20 fansToken = IERC20(tokenInfo.tokenAddress);
-        uint256 contractTokenBalance = fansToken.balanceOf(address(this));
-        require(contractTokenBalance > tokenAmount, "ERC20InsufficientBalance");
+            // Check if the contract has enough tokens to transfer
+            IERC20 fansToken = IERC20(tokenInfo.tokenAddress);
+            uint256 contractTokenBalance = fansToken.balanceOf(address(this));
+            require(contractTokenBalance >= tokenAmount, "ERC20InsufficientBalance");
 
-        // Transfer tokens to user
-        fansToken.transfer(msg.sender, tokenAmount);
+            // Transfer tokens to user
+            fansToken.transfer(msg.sender, tokenAmount);
         }
 
-        // Update tokeninfo
+        // Update token info
         tokenInfo.currencyCollected += netFunds;
         tokenInfo.tokenSold += tokenAmount;
 
@@ -185,7 +187,7 @@ contract FansProtocol is Ownable, ReentrancyGuard {
         uint256 fee = (netFunds * PLATFORM_FEE_BP) / 10000;
         uint256 requiredFunds = netFunds + fee;
 
-        //user transfer currency token to contract
+        // User transfers currency token to contract
         require(requiredFunds > 0 && currencyToken.balanceOf(msg.sender) >= requiredFunds, "Insufficient currency token");
         currencyToken.transferFrom(msg.sender, address(this), requiredFunds);
 
@@ -198,7 +200,7 @@ contract FansProtocol is Ownable, ReentrancyGuard {
         // Check if the contract has enough tokens to transfer
         IERC20 fansToken = IERC20(tokenInfo.tokenAddress);
         uint256 contractTokenBalance = fansToken.balanceOf(address(this));
-        require(contractTokenBalance > tokenAmount, "ERC20InsufficientBalance");
+        require(contractTokenBalance >= tokenAmount, "ERC20InsufficientBalance");
 
         FansToken(tokenInfo.tokenAddress).transfer(msg.sender, tokenAmount);
 
@@ -226,19 +228,20 @@ contract FansProtocol is Ownable, ReentrancyGuard {
 
         // Calculate currency amount to pay
         uint256 currencyToPay = x1 - x2;
-        require(currencyToken.balanceOf(address(this)) >= currencyToPay, "Insufficient ETH in contract");
+        require(currencyToken.balanceOf(address(this)) >= currencyToPay, "Insufficient currency token in contract");
 
         // Calculate fee
         uint256 fee = (currencyToPay * PLATFORM_FEE_BP) / 10000;
         totalFeeCollected += fee;
         uint256 netCurrencyToPay = currencyToPay - fee;
 
-        // Update toke info before external calls
+        // Update token info before external calls
         tokenInfo.currencyCollected = x2;
         tokenInfo.tokenSold = y2;
 
         // Transfer tokens from user to contract and burn them
         FansToken(tokenInfo.tokenAddress).transferFrom(msg.sender, address(this), tokenAmount);
+        FansToken(tokenInfo.tokenAddress).burn(tokenAmount);
 
         // Transfer currency token to user
         currencyToken.transfer(msg.sender, netCurrencyToPay);
@@ -255,43 +258,42 @@ contract FansProtocol is Ownable, ReentrancyGuard {
         }
 
         if(isDEXPhase) {
-            // Transfer remaining fan tokens and collected ether to Trading Protocol to form permanent LP
+            // Transfer remaining fan tokens and collected currency tokens to DEX to form permanent LP
             transferToDEX(tokenId);
         }
     }
-event Debug(string message, uint256 value);
 
-// 在 transferToDEX 中添加日志
-function transferToDEX(uint256 tokenId) internal {
-    TokenInfo storage tokenInfo = tokens[tokenId];
-    uint256 tokenAmount = FansToken(tokenInfo.tokenAddress).balanceOf(address(this));
-    uint256 currencyAmount = tokenInfo.currencyCollected - 20000 * 10**18;
+    // 在 transferToDEX 中添加日志
+    function transferToDEX(uint256 tokenId) internal {
+        TokenInfo storage tokenInfo = tokens[tokenId];
+        uint256 tokenAmount = FansToken(tokenInfo.tokenAddress).balanceOf(address(this));
+        uint256 currencyAmount = tokenInfo.currencyCollected - 20000 * 10**18;
 
-    emit Debug("Token Amount", tokenAmount);
-    emit Debug("Currency Amount", currencyAmount);
+        emit Debug("Token Amount", tokenAmount);
+        emit Debug("Currency Amount", currencyAmount);
 
-    if (tokenAmount > 0 && currencyAmount > 0) {
-        // Approve Uniswap Router to spend tokens
-        FansToken(tokenInfo.tokenAddress).approve(address(uniswapRouter), tokenAmount);
-        currencyToken.approve(address(uniswapRouter), currencyAmount);
+        if (tokenAmount > 0 && currencyAmount > 0) {
+            // Approve Uniswap Router to spend tokens
+            FansToken(tokenInfo.tokenAddress).approve(address(uniswapRouter), tokenAmount);
+            currencyToken.approve(address(uniswapRouter), currencyAmount);
 
-        // Add liquidity
-        uniswapRouter.addLiquidity(
-            tokenInfo.tokenAddress,
-            address(currencyToken),
-            tokenAmount,
-            currencyAmount,
-            0, // Accept any amount of fan tokens
-            0, // Accept any amount of currency token
-            address(this), // Liquidity tokens held by the contract itself
-            block.timestamp
-        );
+            // Add liquidity
+            uniswapRouter.addLiquidity(
+                tokenInfo.tokenAddress,
+                address(currencyToken),
+                tokenAmount,
+                currencyAmount,
+                0, // Accept any amount of fan tokens
+                0, // Accept any amount of currency token
+                address(this), // Liquidity tokens held by the contract itself
+                block.timestamp
+            );
 
-        emit DEXPoolCreation(tokenInfo.tokenAddress, tokenAmount, currencyAmount);
-    } else {
-        emit Debug("Insufficient token or currency amount", 0);
+            emit DEXPoolCreation(tokenInfo.tokenAddress, tokenAmount, currencyAmount);
+        } else {
+            emit Debug("Insufficient token or currency amount", 0);
+        }
     }
-}
 
     // Withdraw platform fees to platform address
     function withdrawFees(address payable to, uint256 amount) external onlyOwner {
@@ -302,4 +304,31 @@ function transferToDEX(uint256 tokenId) internal {
 
     // Allow contract to receive ETH
     receive() external payable {}
+
+    // 新增只读函数，获取Bonding Curve信息
+    function getBondingCurveInfo(uint256 tokenId) external view returns (
+        uint256 price,
+        uint256 bondingCurveProgress, // 百分比
+        uint256 marketValue
+    ) {
+        TokenInfo storage tokenInfo = tokens[tokenId];
+        require(tokenInfo.tokenAddress != address(0), "Invalid token");
+
+        // 计算当前价格 (price)
+        // 价格计算基于当前的货币收藏量和供应量
+        uint256 x = tokenInfo.currencyCollected;
+        uint256 denominator = 30 * 10**18 + (x) / 3000;
+        // 价格可以定义为微小变化下的价格，约等于 dy/dx
+        // 这里简化为当前价格 = B * 10**36 / denominator^2
+        uint256 currentPrice = (B * 10**36) / (denominator * denominator);
+
+        // Bonding Curve的进度百分比
+        uint256 progress = (tokenInfo.currencyCollected * 100 * 1e18) / PROGRESS_THRESHOLD;
+        // 为了返回百分比，保留18位小数
+
+        // 市场价值定义为已收集的货币量
+        uint256 value = tokenInfo.currencyCollected;
+
+        return (currentPrice, progress / 1e18, value);
+    }
 }
